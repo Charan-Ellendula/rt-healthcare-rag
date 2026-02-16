@@ -198,6 +198,12 @@ def init_runtime():
         if children_col.count() == 0:
             st.warning("First-time setup: building the vector index. Please wait (1–3 minutes)...")
             # This requires ingestion/ingest.py to expose run_ingestion()
+            import sys
+            import os
+
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            sys.path.append(project_root)
+
             from ingestion.ingest import run_ingestion
             run_ingestion()
             st.success("Vector index built successfully. Reloading...")
