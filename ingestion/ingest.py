@@ -1,194 +1,259 @@
 # ingestion/ingest.py
+# ingestion/ingest.py
+# ============================================================
+# Ingestion pipeline for RT Healthcare RAG
+# - Loads documents from data/
+# - Parent splitter (coherent blocks)
+# - Child splitter (smaller chunks for retrieval)
+# - Stores parents + children in ChromaDB:
+#     collection: rt_parents (full parent blocks)
+#     collection: rt_children (child chunks w/ parent_id)
+# - Adds metadata for RBAC filtering:
+#     department = folder name (e.g., hr, engineering, policies)
+# - Supports: .md, .txt, .pdf
+#
+# Exposes:
+#   run_ingestion()  -> callable from Streamlit Cloud
+# ============================================================
+
 import os
-import glob
+import re
 import uuid
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Tuple, Optional
 
 import chromadb
 from chromadb.config import Settings
-from sentence_transformers import SentenceTransformer
 from pypdf import PdfReader
 
-SUPPORTED_EXTS = {".txt", ".md", ".pdf"}
 
-def read_text_file(path: str) -> str:
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        return f.read()
+# ---------------------------
+# Paths / Collections
+# ---------------------------
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DATA_ROOT = os.path.join(PROJECT_ROOT, "data")
+CHROMA_PATH = os.path.join(PROJECT_ROOT, "chroma_db")
 
-def read_pdf(path: str) -> str:
-    reader = PdfReader(path)
-    parts = []
-    for page in reader.pages:
-        t = page.extract_text() or ""
-        if t.strip():
-            parts.append(t)
-    return "\n".join(parts)
+PARENTS_COLLECTION = "rt_parents"
+CHILDREN_COLLECTION = "rt_children"
 
-def load_document(path: str) -> str:
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".pdf":
-        return read_pdf(path)
-    return read_text_file(path)
 
-def normalize_ws(text: str) -> str:
-    return " ".join(text.split())
+# ---------------------------
+# Chunking configuration
+# ---------------------------
+PARENT_CHARS = 2200          # size of each parent chunk (characters)
+PARENT_OVERLAP = 200         # overlap between parent chunks
+CHILD_CHARS = 600            # size of each child chunk
+CHILD_OVERLAP = 120          # overlap between child chunks
 
-def parent_split(text: str, max_chars: int = 2200) -> List[str]:
+
+# ---------------------------
+# Helpers
+# ---------------------------
+def _clean_text(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    paras = [p.strip() for p in text.split("\n\n") if p.strip()]
-    if not paras:
-        return []
-    parents, cur = [], ""
-    for p in paras:
-        candidate = (cur + "\n\n" + p).strip() if cur else p
-        if len(candidate) <= max_chars:
-            cur = candidate
-        else:
-            if cur:
-                parents.append(cur)
-            if len(p) > max_chars:
-                start = 0
-                while start < len(p):
-                    end = min(start + max_chars, len(p))
-                    parents.append(p[start:end])
-                    if end == len(p):
-                        break
-                    start = max(0, end - 200)
-                cur = ""
-            else:
-                cur = p
-    if cur:
-        parents.append(cur)
-    return parents
+    # Collapse very long whitespace runs
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
-def child_split(parent_text: str, chunk_size: int = 600, overlap: int = 120) -> List[str]:
-    t = normalize_ws(parent_text)
-    if not t:
+
+def _read_md_or_txt(path: str) -> str:
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return _clean_text(f.read())
+
+
+def _read_pdf(path: str) -> str:
+    reader = PdfReader(path)
+    pages = []
+    for p in reader.pages:
+        try:
+            pages.append(p.extract_text() or "")
+        except Exception:
+            pages.append("")
+    return _clean_text("\n".join(pages))
+
+
+def _is_supported_file(filename: str) -> bool:
+    fn = filename.lower()
+    return fn.endswith(".md") or fn.endswith(".txt") or fn.endswith(".pdf")
+
+
+def _iter_files(root: str) -> List[str]:
+    out = []
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            if _is_supported_file(fn):
+                out.append(os.path.join(dirpath, fn))
+    return sorted(out)
+
+
+def _rel_path(abs_path: str, root: str) -> str:
+    return os.path.relpath(abs_path, root).replace("\\", "/")
+
+
+def _department_from_rel(rel: str) -> str:
+    """
+    Your structure:
+      data/aws/...                  -> aws
+      data/hipaa/...                -> hipaa
+      data/internal/hr/...          -> hr
+      data/internal/engineering/... -> engineering
+
+    We normalize:
+      internal/<dept>/... -> <dept>
+      otherwise           -> first folder name
+    """
+    parts = rel.split("/")
+    if not parts:
+        return "unknown"
+
+    if parts[0] == "internal" and len(parts) > 1:
+        return parts[1]  # hr, engineering, legal_internal, ...
+    return parts[0]      # aws, hipaa, ...
+
+
+def _split_text(text: str, chunk_size: int, overlap: int) -> List[str]:
+    """
+    Simple character splitter with overlap.
+    Keeps chunks non-empty and trimmed.
+    """
+    text = _clean_text(text)
+    if not text:
         return []
-    chunks, start = [], 0
-    while start < len(t):
-        end = min(start + chunk_size, len(t))
-        chunks.append(t[start:end])
-        if end == len(t):
+
+    chunks = []
+    start = 0
+    n = len(text)
+
+    while start < n:
+        end = min(start + chunk_size, n)
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= n:
             break
         start = max(0, end - overlap)
+
     return chunks
 
-def infer_department(data_root: str, file_path: str) -> str:
-    rel = os.path.relpath(file_path, data_root)
-    parts = rel.split(os.sep)
-    return parts[0] if parts else "unknown"
 
-def collect_files(data_root: str) -> List[str]:
-    all_files = []
-    for ext in SUPPORTED_EXTS:
-        all_files.extend(glob.glob(os.path.join(data_root, "**", f"*{ext}"), recursive=True))
-    return sorted(set(all_files))
+def _make_parent_id() -> str:
+    return str(uuid.uuid4())
 
-def build_parent_and_children(data_root: str, file_path: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    raw = load_document(file_path)
-    department = infer_department(data_root, file_path)
-    rel_path = os.path.relpath(file_path, data_root)
 
-    parents = parent_split(raw, max_chars=2200)
-    parent_rows = []
-    child_rows = []
+# ---------------------------
+# Core ingestion
+# ---------------------------
+def ingest(clear_existing: bool = True) -> int:
+    """
+    Returns total number of child chunks inserted.
+    """
 
-    for parent_index, ptxt in enumerate(parents):
-        parent_id = str(uuid.uuid4())
-        parent_rows.append({
-            "id": parent_id,
-            "text": ptxt,
-            "metadata": {
-                "source": rel_path,
-                "department": department,
+    if not os.path.isdir(DATA_ROOT):
+        raise FileNotFoundError(f"data folder not found at: {DATA_ROOT}")
+
+    client = chromadb.PersistentClient(
+        path=CHROMA_PATH,
+        settings=Settings(anonymized_telemetry=False),
+    )
+
+    parents_col = client.get_or_create_collection(PARENTS_COLLECTION)
+    children_col = client.get_or_create_collection(CHILDREN_COLLECTION)
+
+    if clear_existing:
+        # Clear old data (simple + deterministic for demo)
+        try:
+            parents_col.delete(where={})
+        except Exception:
+            pass
+        try:
+            children_col.delete(where={})
+        except Exception:
+            pass
+
+    files = _iter_files(DATA_ROOT)
+    total_children = 0
+
+    for abs_path in files:
+        rel = _rel_path(abs_path, DATA_ROOT)
+        dept = _department_from_rel(rel)
+
+        # Load text
+        if abs_path.lower().endswith(".pdf"):
+            text = _read_pdf(abs_path)
+        else:
+            text = _read_md_or_txt(abs_path)
+
+        if not text:
+            continue
+
+        # Parent chunks
+        parent_chunks = _split_text(text, PARENT_CHARS, PARENT_OVERLAP)
+
+        # Prepare parent inserts
+        parent_ids: List[str] = []
+        parent_docs: List[str] = []
+        parent_metas: List[Dict] = []
+
+        # Prepare child inserts
+        child_ids: List[str] = []
+        child_docs: List[str] = []
+        child_metas: List[Dict] = []
+
+        for parent_index, parent_text in enumerate(parent_chunks):
+            parent_id = _make_parent_id()
+
+            parent_ids.append(parent_id)
+            parent_docs.append(parent_text)
+            parent_metas.append({
+                "department": dept,
+                "source": rel.replace("internal/", ""),  # prettier source display
+                "rel_path": rel,
                 "parent_index": parent_index,
-            }
-        })
+            })
 
-        for child_index, ctxt in enumerate(child_split(ptxt, 600, 120)):
-            child_rows.append({
-                "id": str(uuid.uuid4()),
-                "text": ctxt,
-                "metadata": {
-                    "source": rel_path,
-                    "department": department,
+            # Child chunks from this parent
+            child_chunks = _split_text(parent_text, CHILD_CHARS, CHILD_OVERLAP)
+            for child_index, child_text in enumerate(child_chunks):
+                cid = f"{parent_id}:{child_index}"
+                child_ids.append(cid)
+                child_docs.append(child_text)
+                child_metas.append({
+                    "department": dept,
+                    "source": rel.replace("internal/", ""),
+                    "rel_path": rel,
                     "parent_id": parent_id,
                     "parent_index": parent_index,
                     "child_index": child_index,
-                }
-            })
+                })
 
-    return parent_rows, child_rows
+        # Insert into Chroma
+        if parent_ids:
+            parents_col.add(ids=parent_ids, documents=parent_docs, metadatas=parent_metas)
 
-def clear_collection(col) -> None:
-    try:
-        existing = col.get(include=["ids"])
-        ids = existing.get("ids") or []
-        if ids:
-            col.delete(ids=ids)
-    except Exception:
-        pass
+        if child_ids:
+            children_col.add(ids=child_ids, documents=child_docs, metadatas=child_metas)
+            total_children += len(child_ids)
+
+        print(f"[ingest] {rel} -> {len(child_ids)} child chunks (dept={dept})")
+
+    print(f"[ingest] done. total_child_chunks={total_children}")
+    return total_children
+
+
+# ---------------------------
+# Entry points
+# ---------------------------
+def run_ingestion() -> int:
+    """
+    Callable from Streamlit UI.
+    """
+    return ingest(clear_existing=True)
+
 
 def main():
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    data_root = os.path.join(project_root, "data")
-    db_dir = os.path.join(project_root, "chroma_db")
+    run_ingestion()
 
-    if not os.path.isdir(data_root):
-        raise SystemExit(f"Missing data folder at: {data_root}")
-
-    print(f"[ingest] data_root = {data_root}")
-    print(f"[ingest] chroma_db = {db_dir}")
-
-    client = chromadb.PersistentClient(path=db_dir, settings=Settings(anonymized_telemetry=False))
-    parents_col = client.get_or_create_collection(name="rt_parents")
-    children_col = client.get_or_create_collection(name="rt_children")
-
-    embedder = SentenceTransformer("all-MiniLM-L6-v2")
-
-    files = collect_files(data_root)
-    if not files:
-        raise SystemExit("No supported files found under data/ (txt/md/pdf).")
-
-    print("[ingest] clearing collections...")
-    clear_collection(parents_col)
-    clear_collection(children_col)
-
-    total_parents = 0
-    total_children = 0
-
-    for fp in files:
-        parent_rows, child_rows = build_parent_and_children(data_root, fp)
-        if not child_rows:
-            continue
-
-        # store parents (no embeddings needed)
-        parents_col.add(
-            ids=[p["id"] for p in parent_rows],
-            documents=[p["text"] for p in parent_rows],
-            metadatas=[p["metadata"] for p in parent_rows],
-        )
-
-        # store children with embeddings
-        texts = [c["text"] for c in child_rows]
-        embeddings = embedder.encode(texts, normalize_embeddings=True).tolist()
-
-        children_col.add(
-            ids=[c["id"] for c in child_rows],
-            documents=texts,
-            metadatas=[c["metadata"] for c in child_rows],
-            embeddings=embeddings,
-        )
-
-        total_parents += len(parent_rows)
-        total_children += len(child_rows)
-        print(f"[ingest] {os.path.relpath(fp, data_root)} -> parents={len(parent_rows)} children={len(child_rows)}")
-
-    print(f"[ingest] done. total_parents={total_parents} total_children={total_children}")
-
-def run_ingestion():
-    main()
 
 if __name__ == "__main__":
-    run_ingestion()
+    main()
