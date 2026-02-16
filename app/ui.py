@@ -12,6 +12,7 @@ import time
 # ============================================================
 
 import os
+import sys
 import uuid
 import json
 from datetime import datetime, timezone
@@ -193,32 +194,24 @@ def init_runtime():
     parents_col = client.get_or_create_collection("rt_parents")
     children_col = client.get_or_create_collection("rt_children")
 
-    # ✅ Cloud fix: build index once if empty (fresh Streamlit Cloud container)
-    try:
-        if children_col.count() == 0:
-            st.warning("First-time setup: building the vector index. Please wait (1–3 minutes)...")
-            # This requires ingestion/ingest.py to expose run_ingestion()
-            import sys
-            import os
+# ✅ Cloud fix: build index once if empty (fresh Streamlit Cloud container)
+try:
+    if children_col.count() == 0:
+        st.warning("First-time setup: building the vector index. Please wait (1–3 minutes)...")
 
-            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-            sys.path.append(project_root)
+        # Ensure project root is on the Python path so "ingestion" can be imported on Streamlit Cloud
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
 
-            from ingestion.ingest import run_ingestion
-            run_ingestion()
-            st.success("Vector index built successfully. Reloading...")
-            st.rerun()
-    except Exception as e:
-        st.error(f"Index build failed: {e}")
-        st.stop()
+        from ingestion.ingest import run_ingestion
+        run_ingestion()
 
-    embedder = SentenceTransformer("all-MiniLM-L6-v2")
+        st.success("Vector index built successfully. Reloading...")
+        st.rerun()
 
-    rules = load_yaml(os.path.join(project_root, "rbac_rules.yaml"))
-    users = load_yaml(os.path.join(project_root, "users.yaml")).get("users", {})
-
-    return project_root, model, parents_col, children_col, embedder, rules, users
-
+except Exception as e:
+    st.error(f"Index build failed: {e}")
+    st.stop()
 
 # ---------------------------
 # Login UI
