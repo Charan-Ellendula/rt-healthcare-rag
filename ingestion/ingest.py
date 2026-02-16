@@ -187,5 +187,8 @@ def main():
 
     print(f"[ingest] done. total_parents={total_parents} total_children={total_children}")
 
-if __name__ == "__main__":
+def run_ingestion():
     main()
+
+if __name__ == "__main__":
+    run_ingestion()

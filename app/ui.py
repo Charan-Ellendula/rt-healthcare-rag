@@ -1,3 +1,16 @@
+import time
+# app/ui.py
+# ============================================================
+# Streamlit UI for RBAC RAG (Chroma + Gemini)
+# - Login with users.yaml (demo users)
+# - Role auto-selected from user profile
+# - RBAC enforced at retrieval time (Chroma metadata filter)
+# - Parent/Child RAG: retrieve children, fetch parents for coherence
+# - Conversational memory (Streamlit session_state)
+# - Audit logging (JSONL)
+# - Cloud fix: auto-build Chroma index on first run (empty DB)
+# ============================================================
+
 import os
 import uuid
 import json
@@ -154,28 +167,45 @@ Context blocks:
 
 
 # ---------------------------
-# App
+# Runtime initialization
 # ---------------------------
 def init_runtime():
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+    # Load local .env if present (local dev); Streamlit Cloud uses Secrets->env vars
     load_dotenv(os.path.join(project_root, ".env"))
 
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
+
     if not api_key:
-        st.error("Missing GEMINI_API_KEY in .env")
+        st.error("Missing GEMINI_API_KEY (set it in Streamlit Secrets or local .env)")
         st.stop()
 
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
 
+    # Chroma (2 collections)
     client = chromadb.PersistentClient(
         path=os.path.join(project_root, "chroma_db"),
         settings=Settings(anonymized_telemetry=False),
     )
-
     parents_col = client.get_or_create_collection("rt_parents")
     children_col = client.get_or_create_collection("rt_children")
+
+    # ✅ Cloud fix: build index once if empty (fresh Streamlit Cloud container)
+    try:
+        if children_col.count() == 0:
+            st.warning("First-time setup: building the vector index. Please wait (1–3 minutes)...")
+            # This requires ingestion/ingest.py to expose run_ingestion()
+            from ingestion.ingest import run_ingestion
+            run_ingestion()
+            st.success("Vector index built successfully. Reloading...")
+            st.rerun()
+    except Exception as e:
+        st.error(f"Index build failed: {e}")
+        st.stop()
+
     embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
     rules = load_yaml(os.path.join(project_root, "rbac_rules.yaml"))
@@ -184,6 +214,9 @@ def init_runtime():
     return project_root, model, parents_col, children_col, embedder, rules, users
 
 
+# ---------------------------
+# Login UI
+# ---------------------------
 def login_ui(users: Dict[str, Any]):
     st.title("RT Healthcare RAG (RBAC Demo)")
     st.subheader("Login")
@@ -207,6 +240,9 @@ def login_ui(users: Dict[str, Any]):
         st.rerun()
 
 
+# ---------------------------
+# Chat UI
+# ---------------------------
 def chat_ui(project_root, model, parents_col, children_col, embedder, rules):
     st.title("RT Healthcare RAG (RBAC Demo)")
 
@@ -215,10 +251,9 @@ def chat_ui(project_root, model, parents_col, children_col, embedder, rules):
     session_id = st.session_state["session_id"]
 
     allowed_depts = allowed_departments_for_role(rules, role)
-
     st.caption(f"User: {username} | Role: {role} | Allowed: {', '.join(allowed_depts)} | Session: {session_id}")
 
-    # show history
+    # Render previous messages
     for h in st.session_state["history"]:
         with st.chat_message(h["role"]):
             st.write(h["text"])
@@ -227,13 +262,13 @@ def chat_ui(project_root, model, parents_col, children_col, embedder, rules):
     if not question:
         return
 
-    # add user turn
+    # User turn
     st.session_state["history"].append({"role": "user", "text": question})
     st.session_state["history"] = trim_history(st.session_state["history"])
     with st.chat_message("user"):
         st.write(question)
 
-    # retrieve
+    # Retrieve
     retrieved_children = retrieve_children(children_col, embedder, question, allowed_depts)
     context_blocks, citations = build_parent_context_from_ids(parents_col, retrieved_children)
 
@@ -244,14 +279,14 @@ def chat_ui(project_root, model, parents_col, children_col, embedder, rules):
         resp = model.generate_content(prompt)
         answer = (resp.text or "").strip()
 
-    # show assistant answer
+    # Assistant turn
     st.session_state["history"].append({"role": "assistant", "text": answer})
     st.session_state["history"] = trim_history(st.session_state["history"])
 
     with st.chat_message("assistant"):
         st.write(answer)
 
-    # audit log
+    # Audit log
     append_audit({
         "ts": utc_now_iso(),
         "session_id": session_id,
@@ -265,22 +300,29 @@ def chat_ui(project_root, model, parents_col, children_col, embedder, rules):
     }, project_root)
 
 
+# ---------------------------
+# Streamlit main
+# ---------------------------
 def main():
     project_root, model, parents_col, children_col, embedder, rules, users = init_runtime()
 
     if "authed" not in st.session_state:
         st.session_state["authed"] = False
 
+    # Sidebar actions
+    with st.sidebar:
+        st.header("Controls")
+        if st.session_state.get("authed"):
+            if st.button("Logout"):
+                for k in ["authed", "username", "role", "session_id", "history"]:
+                    if k in st.session_state:
+                        del st.session_state[k]
+                st.rerun()
+        st.caption("Tip: On first cloud run, the app auto-builds the vector index.")
+
     if not st.session_state["authed"]:
         login_ui(users)
         return
-
-    # logout
-    if st.sidebar.button("Logout"):
-        for k in ["authed", "username", "role", "session_id", "history"]:
-            if k in st.session_state:
-                del st.session_state[k]
-        st.rerun()
 
     chat_ui(project_root, model, parents_col, children_col, embedder, rules)
 
