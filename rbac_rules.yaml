@@ -1,0 +1,15 @@
+roles:
+  engineering:
+    allow_departments: ["engineering", "policies", "sop", "risk_governance"]
+  hr:
+    allow_departments: ["hr", "policies"]
+  legal:
+    allow_departments: ["legal_internal", "policies", "risk_governance"]
+  operations:
+    allow_departments: ["operations", "policies", "sop"]
+  security:
+    allow_departments: ["security", "policies", "risk_governance", "sop", "hipaa", "aws"]
+  risk:
+    allow_departments: ["risk_governance", "policies", "aws"]
+
+default_deny: true

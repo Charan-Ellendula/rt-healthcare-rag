@@ -1,0 +1,24 @@
+users:
+  alice_eng:
+    password: "Eng@1234"
+    role: "engineering"
+
+  bob_hr:
+    password: "Hr@1234"
+    role: "hr"
+
+  carol_legal:
+    password: "Legal@1234"
+    role: "legal"
+
+  dave_ops:
+    password: "Ops@1234"
+    role: "operations"
+
+  eve_sec:
+    password: "Sec@1234"
+    role: "security"
+
+  rita_risk:
+    password: "Risk@1234"
+    role: "risk"
