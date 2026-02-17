@@ -182,10 +182,23 @@ def get_embedder():
 
 @st.cache_resource
 def get_chroma_collections(project_root: str):
-    client = chromadb.PersistentClient(
-        path=os.path.join(project_root, "chroma_db"),
-        settings=Settings(anonymized_telemetry=False),
-    )
+    """
+    Cloud-safe:
+    - Streamlit Cloud: use in-memory Chroma (no disk persistence -> avoids HNSW disk errors)
+    - Local: use PersistentClient at chroma_db/
+    """
+    is_cloud = os.environ.get("STREAMLIT_SERVER_RUNNING", "") == "1" or os.environ.get("STREAMLIT_CLOUD", "") == "true"
+
+    if is_cloud:
+        # In-memory (no chroma_db folder)
+        client = chromadb.Client(Settings(anonymized_telemetry=False))
+    else:
+        # Local persistent
+        client = chromadb.PersistentClient(
+            path=os.path.join(project_root, "chroma_db"),
+            settings=Settings(anonymized_telemetry=False),
+        )
+
     parents_col = client.get_or_create_collection("rt_parents")
     children_col = client.get_or_create_collection("rt_children")
     return parents_col, children_col
@@ -221,26 +234,15 @@ def init_runtime():
     # If empty, run ingestion/ingest.py via subprocess (no imports)
     # ------------------------------------------------------------
     try:
-        if children_col.count() == 0:
-            st.warning("First-time setup: building the vector index. Please wait (1–3 minutes)...")
+    if children_col.count() == 0:
+        st.warning("First-time setup: building the vector index. Please wait (1–3 minutes)...")
 
-            ingest_path = os.path.join(project_root, "ingestion", "ingest.py")
-            result = subprocess.run(
-                [sys.executable, ingest_path],
-                cwd=project_root,
-                capture_output=True,
-                text=True,
-            )
+        # Run ingestion in the same process so it writes into the same in-memory client on cloud
+        from ingestion.ingest import run_ingestion
+        run_ingestion(clear_existing=True)
 
-            if result.returncode != 0:
-                st.error("Index build failed. Output below:")
-                st.code((result.stdout or "") + "\n" + (result.stderr or ""))
-                st.stop()
-
-            st.success("Vector index built successfully. Reloading...")
-            # Clear cached chroma collections so we re-open fresh after ingestion
-            get_chroma_collections.clear()
-            st.rerun()
+        st.success("Vector index built successfully. Reloading...")
+        st.rerun()
     except Exception as e:
         st.error(f"Index build failed: {e}")
         st.stop()
@@ -320,7 +322,7 @@ def chat_ui(project_root, model, parents_col, children_col, embedder, rules):
     with st.chat_message("user"):
         st.write(question)
 
-    st.write("DEBUG children_col type:", type(children_col))
+   
 
     # Retrieve + build context
     try:
