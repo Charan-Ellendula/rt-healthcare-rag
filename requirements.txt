@@ -1,5 +1,5 @@
 streamlit
-chromadb
+chromadb==1.5.0
 sentence-transformers
 pyyaml
 python-dotenv
