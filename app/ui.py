@@ -17,6 +17,8 @@ import sys
 import uuid
 import json
 import subprocess
+import shutil
+from chromadb.errors import InternalError
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Tuple
 
@@ -273,6 +275,22 @@ def login_ui(users: Dict[str, Any]):
         st.success(f"Logged in as {username} (role={st.session_state['role']}).")
         st.rerun()
 
+def rebuild_index(project_root: str):
+    # delete local persisted chroma_db and rebuild by running ingestion script
+    chroma_path = os.path.join(project_root, "chroma_db")
+    if os.path.exists(chroma_path):
+        shutil.rmtree(chroma_path, ignore_errors=True)
+
+    ingest_path = os.path.join(project_root, "ingestion", "ingest.py")
+    result = subprocess.run(
+        [sys.executable, ingest_path],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError((result.stdout or "") + "\n" + (result.stderr or ""))
+
 
 # ---------------------------
 # Chat UI
@@ -303,7 +321,20 @@ def chat_ui(project_root, model, parents_col, children_col, embedder, rules):
         st.write(question)
 
     # Retrieve + build context
+    try:
     retrieved_children = retrieve_children(children_col, embedder, question, allowed_depts)
+except InternalError:
+    st.warning("Vector index had an internal error. Rebuilding index now (one-time fix)...")
+    try:
+        rebuild_index(project_root)
+        # Clear cached chroma handle so we reopen fresh
+        get_chroma_collections.clear()
+        parents_col, children_col = get_chroma_collections(project_root)
+        retrieved_children = retrieve_children(children_col, embedder, question, allowed_depts)
+    except Exception as e:
+        st.error("Rebuild failed. See details below:")
+        st.code(str(e))
+        st.stop()
     context_blocks, citations = build_parent_context(parents_col, retrieved_children)
 
     # Answer
