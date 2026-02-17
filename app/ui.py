@@ -321,18 +321,27 @@ def chat_ui(project_root, model, parents_col, children_col, embedder, rules):
         st.write(question)
 
     # Retrieve + build context
-    try:
-    retrieved_children = retrieve_children(children_col, embedder, question, allowed_depts)
+try:
+    retrieved_children = retrieve_children(
+        children_col,
+        embedder,
+        question,
+        allowed_depts
+    )
 except InternalError:
     st.warning("Vector index had an internal error. Rebuilding index now (one-time fix)...")
     try:
         rebuild_index(project_root)
-        # Clear cached chroma handle so we reopen fresh
         get_chroma_collections.clear()
         parents_col, children_col = get_chroma_collections(project_root)
-        retrieved_children = retrieve_children(children_col, embedder, question, allowed_depts)
+        retrieved_children = retrieve_children(
+            children_col,
+            embedder,
+            question,
+            allowed_depts
+        )
     except Exception as e:
-        st.error("Rebuild failed. See details below:")
+        st.error("Rebuild failed:")
         st.code(str(e))
         st.stop()
     context_blocks, citations = build_parent_context(parents_col, retrieved_children)
