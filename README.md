@@ -11,7 +11,7 @@ Built to demonstrate production-style AI system design in a healthcare governanc
 Deployed on Streamlit Community Cloud.
 
 Access via:
-https://<your-app-url>.streamlit.app
+https://rt-healthcare-rag.streamlit.app
 
 ---
 
