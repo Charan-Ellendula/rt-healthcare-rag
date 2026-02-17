@@ -1,24 +1,24 @@
 # app/ui.py
 # ============================================================
-# RT Healthcare RBAC RAG (Streamlit)
-# - Login (users.yaml) -> role auto-selected
-# - RBAC enforced at retrieval time (Chroma metadata filter)
+# Streamlit UI:
+# - Login (users.yaml) -> role auto-assigned
+# - RBAC enforced at retrieval time (Chroma where filter)
 # - Parent/Child RAG:
-#     * search child chunks in rt_children
-#     * expand to parent chunks from rt_parents for coherent context
-# - Conversational memory (st.session_state["history"])
-# - Audit logging (audit_log.jsonl)
-# - Cloud-safe indexing:
-#     If Chroma is empty, run ingestion/ingest.py via subprocess (no imports)
+#     * semantic search on rt_children
+#     * expand to rt_parents for coherent context
+# - Conversational memory
+# - Audit logging JSONL
+#
+# Cloud stability:
+# - Streamlit Cloud uses in-memory Chroma (avoids HNSW disk errors)
+# - Local uses persistent Chroma at chroma_db/
+# - On first run (empty rt_children), build index by calling run_ingestion(client=client)
+#   so UI + ingestion share the same in-memory client on Cloud.
 # ============================================================
 
 import os
-import sys
 import uuid
 import json
-import subprocess
-import shutil
-from chromadb.errors import InternalError
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Tuple
 
@@ -30,19 +30,20 @@ from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 import google.generativeai as genai
 
+from ingestion.ingest import run_ingestion
+
 
 # ---------------------------
-# Config
+# Config knobs
 # ---------------------------
 AUDIT_LOG_PATH = "audit_log.jsonl"
-
 TOP_K_CHILD = 8
 MAX_PARENTS_IN_CONTEXT = 3
 MAX_HISTORY_TURNS = 4
 
 
 # ---------------------------
-# Utilities
+# Utility helpers
 # ---------------------------
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -78,12 +79,57 @@ def format_history(history: List[Dict[str, str]]) -> str:
 
 
 # ---------------------------
-# Retrieval: children + parents
+# Cloud detection (simple + robust)
+# ---------------------------
+def is_streamlit_cloud() -> bool:
+    # Streamlit Cloud often runs from /mount/src/<repo>
+    if os.path.exists("/mount/src"):
+        return True
+    # fallback env hints (may or may not exist)
+    if os.environ.get("STREAMLIT_SERVER_RUNNING") == "1":
+        return True
+    return False
+
+
+# ---------------------------
+# Cached heavy resources (speed)
+# ---------------------------
+@st.cache_resource
+def get_embedder():
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+
+@st.cache_resource
+def get_gemini_model(model_name: str, api_key: str):
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel(model_name)
+
+
+@st.cache_resource
+def get_chroma_client(project_root: str):
+    """
+    Cloud: in-memory client
+    Local: persistent client at chroma_db/
+    """
+    if is_streamlit_cloud():
+        return chromadb.Client(Settings(anonymized_telemetry=False))
+    return chromadb.PersistentClient(
+        path=os.path.join(project_root, "chroma_db"),
+        settings=Settings(anonymized_telemetry=False),
+    )
+
+
+def get_collections(client):
+    parents_col = client.get_or_create_collection("rt_parents")
+    children_col = client.get_or_create_collection("rt_children")
+    return parents_col, children_col
+
+
+# ---------------------------
+# Retrieval + Parent expansion
 # ---------------------------
 def retrieve_children(children_col, embedder, question: str, allowed_depts: List[str], k: int = TOP_K_CHILD) -> List[Dict[str, Any]]:
     q_emb = embedder.encode([question], normalize_embeddings=True).tolist()[0]
-
-    # RBAC enforced here: Chroma only returns chunks from allowed departments
     where_filter = {"department": {"$in": allowed_depts}} if allowed_depts else {"department": "__none__"}
 
     res = children_col.query(
@@ -107,6 +153,7 @@ def retrieve_children(children_col, embedder, question: str, allowed_depts: List
             continue
         seen.add(key)
         out.append({"text": doc, "metadata": meta, "distance": float(dist)})
+
     return out
 
 
@@ -135,12 +182,14 @@ def build_parent_context(parents_col, retrieved_children: List[Dict[str, Any]], 
 
     for i, (ptxt, pmeta) in enumerate(zip(parent_docs, parent_metas), start=1):
         context_blocks.append(f"[{i}] {ptxt}")
-        citations.append({
-            "n": i,
-            "source": (pmeta or {}).get("source"),
-            "department": (pmeta or {}).get("department"),
-            "parent_index": (pmeta or {}).get("parent_index"),
-        })
+        citations.append(
+            {
+                "n": i,
+                "source": (pmeta or {}).get("source"),
+                "department": (pmeta or {}).get("department"),
+                "parent_index": (pmeta or {}).get("parent_index"),
+            }
+        )
 
     return context_blocks, citations
 
@@ -173,99 +222,36 @@ Context blocks:
 
 
 # ---------------------------
-# Cached heavy resources (fast UI)
-# ---------------------------
-@st.cache_resource
-def get_embedder():
-    return SentenceTransformer("all-MiniLM-L6-v2")
-
-
-@st.cache_resource
-def get_chroma_collections(project_root: str):
-    """
-    Cloud-safe:
-    - Streamlit Cloud: use in-memory Chroma (no disk persistence -> avoids HNSW disk errors)
-    - Local: use PersistentClient at chroma_db/
-    """
-    is_cloud = os.environ.get("STREAMLIT_SERVER_RUNNING", "") == "1" or os.environ.get("STREAMLIT_CLOUD", "") == "true"
-
-    if is_cloud:
-        # In-memory (no chroma_db folder)
-        client = chromadb.Client(Settings(anonymized_telemetry=False))
-    else:
-        # Local persistent
-        client = chromadb.PersistentClient(
-            path=os.path.join(project_root, "chroma_db"),
-            settings=Settings(anonymized_telemetry=False),
-        )
-
-    parents_col = client.get_or_create_collection("rt_parents")
-    children_col = client.get_or_create_collection("rt_children")
-    return parents_col, children_col
-
-
-@st.cache_resource
-def get_gemini_model(model_name: str, api_key: str):
-    genai.configure(api_key=api_key)
-    return genai.GenerativeModel(model_name)
-
-
-# ---------------------------
-# Init runtime
+# Runtime init
 # ---------------------------
 def init_runtime():
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
+    # local: load .env; cloud: secrets become env vars
     load_dotenv(os.path.join(project_root, ".env"))
 
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
     if not api_key:
-        st.error("Missing GEMINI_API_KEY.")
+        st.error("Missing GEMINI_API_KEY. Set it in Streamlit Secrets (or local .env).")
         st.stop()
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
+    model = get_gemini_model(model_name, api_key)
 
-    # Always use in-memory Chroma on Streamlit Cloud
-    client = chromadb.Client(Settings(anonymized_telemetry=False))
-    parents_col = client.get_or_create_collection("rt_parents")
-    children_col = client.get_or_create_collection("rt_children")
+    client = get_chroma_client(project_root)
+    parents_col, children_col = get_collections(client)
 
-    # Build index once per app start
-    if children_col.count() == 0:
-        st.warning("Building vector index (one-time setup)...")
-        from ingestion.ingest import run_ingestion
-        run_ingestion(clear_existing=True)
-        st.success("Index built.")
-
-    embedder = SentenceTransformer("all-MiniLM-L6-v2")
-
-    rules = load_yaml(os.path.join(project_root, "rbac_rules.yaml"))
-    users = load_yaml(os.path.join(project_root, "users.yaml")).get("users", {})
-
-    return project_root, model, parents_col, children_col, embedder, rules, users
-
-    # ------------------------------------------------------------
-    # Cloud-safe index build:
-    # If empty, run ingestion/ingest.py via subprocess (no imports)
-    # ------------------------------------------------------------
-    try:
+    # Build index if empty
     if children_col.count() == 0:
         st.warning("First-time setup: building the vector index. Please wait (1–3 minutes)...")
-
-        # Run ingestion in the same process so it writes into the same in-memory client on cloud
-        from ingestion.ingest import run_ingestion
-        run_ingestion(clear_existing=True)
-
-        st.success("Vector index built successfully. Reloading...")
+        # Critical: pass the SAME client so cloud builds in the same in-memory DB
+        run_ingestion(clear_existing=True, client=client)
+        st.success("Index built. Reloading...")
         st.rerun()
-    except Exception as e:
-        st.error(f"Index build failed: {e}")
-        st.stop()
 
     embedder = get_embedder()
+
     rules = load_yaml(os.path.join(project_root, "rbac_rules.yaml"))
     users = load_yaml(os.path.join(project_root, "users.yaml")).get("users", {})
 
@@ -281,6 +267,7 @@ def login_ui(users: Dict[str, Any]):
 
     username = st.text_input("Username")
     password = st.text_input("Password", type="password")
+
     if st.button("Login"):
         u = users.get(username)
         if not u or u.get("password") != password:
@@ -292,24 +279,7 @@ def login_ui(users: Dict[str, Any]):
         st.session_state["role"] = u.get("role")
         st.session_state["session_id"] = str(uuid.uuid4())
         st.session_state["history"] = []
-        st.success(f"Logged in as {username} (role={st.session_state['role']}).")
         st.rerun()
-
-def rebuild_index(project_root: str):
-    # delete local persisted chroma_db and rebuild by running ingestion script
-    chroma_path = os.path.join(project_root, "chroma_db")
-    if os.path.exists(chroma_path):
-        shutil.rmtree(chroma_path, ignore_errors=True)
-
-    ingest_path = os.path.join(project_root, "ingestion", "ingest.py")
-    result = subprocess.run(
-        [sys.executable, ingest_path],
-        cwd=project_root,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError((result.stdout or "") + "\n" + (result.stderr or ""))
 
 
 # ---------------------------
@@ -323,7 +293,7 @@ def chat_ui(project_root, model, parents_col, children_col, embedder, rules):
     session_id = st.session_state["session_id"]
     allowed_depts = allowed_departments_for_role(rules, role)
 
-    st.caption(f"User: {username} | Role: {role} | Allowed: {', '.join(allowed_depts)}")
+    st.caption(f"User: {username} | Role: {role} | Allowed: {', '.join(allowed_depts)} | Session: {session_id}")
 
     # Render history
     for h in st.session_state["history"]:
@@ -340,24 +310,10 @@ def chat_ui(project_root, model, parents_col, children_col, embedder, rules):
     with st.chat_message("user"):
         st.write(question)
 
-   
-
     # Retrieve + build context
-    try:
-        retrieved_children = retrieve_children(children_col, embedder, question, allowed_depts)
-    except InternalError:
-        st.warning("Vector index had an internal error. Rebuilding index now (one-time fix)...")
-        try:
-            rebuild_index(project_root)
-            get_chroma_collections.clear()
-            parents_col, children_col = get_chroma_collections(project_root)
-            retrieved_children = retrieve_children(children_col, embedder, question, allowed_depts)
-        except Exception as e:
-            st.error("Rebuild failed:")
-            st.code(str(e))
-            st.stop()
-
+    retrieved_children = retrieve_children(children_col, embedder, question, allowed_depts)
     context_blocks, citations = build_parent_context(parents_col, retrieved_children)
+
     # Answer
     if not context_blocks:
         answer = "I don't have enough information in the allowed documents."
