@@ -216,18 +216,36 @@ def get_gemini_model(model_name: str, api_key: str):
 def init_runtime():
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-    # Local dev: load .env if present. Cloud: Secrets become env vars.
     load_dotenv(os.path.join(project_root, ".env"))
 
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
     if not api_key:
-        st.error("Missing GEMINI_API_KEY. Set it in Streamlit Secrets (or local .env).")
+        st.error("Missing GEMINI_API_KEY.")
         st.stop()
 
-    model = get_gemini_model(model_name, api_key)
-    parents_col, children_col = get_chroma_collections(project_root)
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(model_name)
+
+    # Always use in-memory Chroma on Streamlit Cloud
+    client = chromadb.Client(Settings(anonymized_telemetry=False))
+    parents_col = client.get_or_create_collection("rt_parents")
+    children_col = client.get_or_create_collection("rt_children")
+
+    # Build index once per app start
+    if children_col.count() == 0:
+        st.warning("Building vector index (one-time setup)...")
+        from ingestion.ingest import run_ingestion
+        run_ingestion(clear_existing=True)
+        st.success("Index built.")
+
+    embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+    rules = load_yaml(os.path.join(project_root, "rbac_rules.yaml"))
+    users = load_yaml(os.path.join(project_root, "users.yaml")).get("users", {})
+
+    return project_root, model, parents_col, children_col, embedder, rules, users
 
     # ------------------------------------------------------------
     # Cloud-safe index build:
