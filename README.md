@@ -8,10 +8,7 @@ Built to demonstrate production-style AI system design in a healthcare governanc
 
 ## 🚀 Live Demo
 
-Deployed on Streamlit Community Cloud.
-
-Access via:
-https://rt-healthcare-rag.streamlit.app
+This project has migrated from a Streamlit UI to a React + FastAPI stack (see [Local Setup](#️-local-setup)). The previous Streamlit Community Cloud deployment is no longer wired up and will need to be retired/replaced separately.
 
 ---
 
@@ -141,7 +138,15 @@ This simulates enterprise compliance logging requirements.
 rt-healthcare-rag/
 │
 ├── app/
-│   └── ui.py
+│   ├── core.py     # shared RAG + RBAC logic
+│   ├── server.py   # FastAPI backend (REST API)
+│   └── main.py     # CLI variant (optional, for local testing)
+│
+├── frontend/       # React + TypeScript + Tailwind UI
+│   └── src/
+│       ├── components/
+│       ├── api.ts
+│       └── App.tsx
 │
 ├── ingestion/
 │   ├── __init__.py
@@ -170,9 +175,10 @@ rt-healthcare-rag/
 - LLM: Google Gemini 2.5 Flash
 - Vector Database: Chroma (Persistent)
 - Embeddings: all-MiniLM-L6-v2
-- Framework: Streamlit
+- Backend: FastAPI (REST API)
+- Frontend: React + TypeScript + Vite + Tailwind CSS
 - Auth Layer: YAML-based pseudo-identity
-- Language: Python 3.9+
+- Language: Python 3.9+ / Node 18+
 
 ---
 
@@ -185,7 +191,9 @@ git clone https://github.com/Charan-Ellendula/rt-healthcare-rag.git
 cd rt-healthcare-rag
 ```
 
-Create environment:
+### Backend
+
+Create environment and install dependencies:
 
 ```bash
 python3 -m venv venv
@@ -193,47 +201,38 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Create `.env` file:
+Create `.env` file in the project root:
 
 ```
 GEMINI_API_KEY=your_key_here
 GEMINI_MODEL=gemini-2.5-flash
 ```
 
-Run ingestion:
+Start the API server (this also builds the vector index on first run if empty):
 
 ```bash
-python ingestion/ingest.py
+uvicorn app.server:app --port 8000
 ```
 
-Start app:
+The API is now available at `http://localhost:8000` (docs at `/docs`).
+
+### Frontend
+
+In a separate terminal:
 
 ```bash
-streamlit run app/ui.py
+cd frontend
+npm install
+npm run dev
 ```
 
 Open:
 
 ```
-http://localhost:8501
+http://localhost:5173
 ```
 
----
-
-## 🌍 Deployment
-
-Deployed using:
-
-- Streamlit Community Cloud
-- GitHub integration
-- Secrets configured in Streamlit dashboard
-
-Environment variables are set via Streamlit Secrets:
-
-```
-GEMINI_API_KEY="your_key_here"
-GEMINI_MODEL="gemini-2.5-flash"
-```
+Log in with one of the demo accounts in [users.yaml](users.yaml) (e.g. `alice_eng` / `Eng@1234`).
 
 ---
 
